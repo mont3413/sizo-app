@@ -1,0 +1,19 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Основные стили для Telegram Mini App */
+body {
+  margin: 0;
+  padding: 0;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background-color: #111827;
+  color: white;
+  -webkit-tap-highlight-color: transparent;
+}
+
+/* Чтобы лучше выглядело в Telegram */
+#root {
+  max-width: 100%;
+  margin: 0 auto;
+}
