@@ -3,15 +3,15 @@ import Calendar from 'react-calendar';
 import 'react-calendar/dist/Calendar.css';
 import { ArrowLeft, Plus } from 'lucide-react';
 
-type Record = { rowNum: number; value: string };
+const BACKEND_URL = 'https://sizo-app.onrender.com';
 
-const BACKEND_URL = 'https://sizo-app.onrender.com';   // ← твой бэкенд
+type Cell = { value: string };
 
 function App() {
   const [selectedDate, setSelectedDate] = useState(new Date());
   const [showModal, setShowModal] = useState(false);
   const [currentType, setCurrentType] = useState<'advocate' | 'transfer' | 'visit' | null>(null);
-  const [records, setRecords] = useState<Record[]>([]);
+  const [tableData, setTableData] = useState<Cell[][]>([]);
 
   const dateStr = selectedDate.toISOString().split('T')[0];
 
@@ -23,36 +23,45 @@ function App() {
 
   const headers = ['СИЗО 1', 'СИЗО 2', 'СИЗО 3', 'СИЗО 4', 'СИЗО 5', 'СИЗО 6', 'СИЗО 7'];
 
-  // Загрузка записей
   useEffect(() => {
     if (currentType) {
       fetch(`${BACKEND_URL}/records/${dateStr}/${currentType}`)
         .then(r => r.json())
-        .then(data => {
-          const arr = Array.from({ length: 15 }, (_, i) => {
-            const rowNum = i + 1;
-            const existing = data.find((r: any) => r.rowNum === rowNum);
-            return { rowNum, value: existing?.value || '' };
+        .then((data: any[]) => {
+          const newData = Array.from({ length: 15 }, (_, rowIdx) => {
+            const rowCells = Array.from({ length: 7 }, (_, colIdx) => {
+              const cellNum = rowIdx * 7 + colIdx + 1;
+              const existing = data.find((r: any) => r.rowNum === cellNum);
+              return { value: existing?.value || '' };
+            });
+            return rowCells;
           });
-          setRecords(arr);
-        })
-        .catch(err => console.error('Ошибка загрузки:', err));
+          setTableData(newData);
+        });
     }
   }, [dateStr, currentType]);
 
-  const saveRecord = (rowNum: number, value: string) => {
+  const saveCell = (rowIdx: number, colIdx: number, value: string) => {
     if (!currentType) return;
-    
+    const cellNum = rowIdx * 7 + colIdx + 1;
+
     fetch(`${BACKEND_URL}/records`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ 
         date: dateStr, 
         type: currentType, 
-        rowNum, 
+        rowNum: cellNum, 
         value 
       })
-    }).catch(err => console.error('Ошибка сохранения:', err));
+    });
+  };
+
+  const updateCell = (rowIdx: number, colIdx: number, value: string) => {
+    const newData = [...tableData];
+    newData[rowIdx][colIdx].value = value;
+    setTableData(newData);
+    saveCell(rowIdx, colIdx, value);
   };
 
   return (
@@ -73,14 +82,13 @@ function App() {
         <div className="flex justify-center">
           <button
             onClick={() => setShowModal(true)}
-            className="bg-blue-600 hover:bg-blue-700 px-12 py-6 rounded-2xl text-xl font-medium flex items-center gap-3 shadow-xl active:scale-95 transition-transform"
+            className="bg-blue-600 hover:bg-blue-700 px-12 py-6 rounded-2xl text-xl font-medium flex items-center gap-3 shadow-xl"
           >
             <Plus size={32} /> Выбрать действие
           </button>
         </div>
       </div>
 
-      {/* Модальное окно выбора */}
       {showModal && (
         <div className="fixed inset-0 bg-black/90 flex items-center justify-center z-50 p-4">
           <div className="bg-gray-900 rounded-3xl p-8 w-full max-w-sm">
@@ -92,30 +100,23 @@ function App() {
                 <button
                   key={key}
                   onClick={() => { setCurrentType(key as any); setShowModal(false); }}
-                  className="w-full py-6 bg-gray-800 hover:bg-gray-700 rounded-2xl text-xl font-medium active:bg-gray-600 transition"
+                  className="w-full py-6 bg-gray-800 hover:bg-gray-700 rounded-2xl text-xl font-medium"
                 >
                   {name}
                 </button>
               ))}
             </div>
-            <button 
-              onClick={() => setShowModal(false)} 
-              className="mt-6 text-gray-400 w-full py-3 hover:text-white transition"
-            >
+            <button onClick={() => setShowModal(false)} className="mt-6 text-gray-400 w-full py-3">
               Отмена
             </button>
           </div>
         </div>
       )}
 
-      {/* Таблица */}
-      {currentType && (
+      {currentType && tableData.length > 0 && (
         <div className="px-4">
           <div className="flex items-center gap-4 mb-6">
-            <button 
-              onClick={() => setCurrentType(null)}
-              className="p-3 bg-gray-800 rounded-2xl hover:bg-gray-700"
-            >
+            <button onClick={() => setCurrentType(null)} className="p-3 bg-gray-800 rounded-2xl">
               <ArrowLeft size={28} />
             </button>
             <h2 className="text-2xl font-bold">
@@ -124,31 +125,28 @@ function App() {
           </div>
 
           <div className="overflow-x-auto bg-gray-900 rounded-3xl p-4">
-            <table className="w-full">
+            <table className="w-full border-collapse">
               <thead>
                 <tr className="bg-gray-800">
-                  <th className="p-4 text-center">#</th>
+                  <th className="p-4 text-center w-12 text-white">#</th>
                   {headers.map((h, i) => (
-                    <th key={i} className="p-4 text-center font-medium">{h}</th>
+                    <th key={i} className="p-4 text-center font-medium text-white border-l border-gray-700">{h}</th>
                   ))}
                 </tr>
               </thead>
               <tbody>
-                {records.map((row, idx) => (
-                  <tr key={idx} className="border-t border-gray-700 hover:bg-gray-800/50">
-                    <td className="p-4 text-center font-bold">{idx + 1}</td>
-                    {Array.from({ length: 7 }).map((_, col) => (
-                      <td key={col} className="p-2">
+                {tableData.map((row, rowIdx) => (
+                  <tr key={rowIdx} className="border-t border-gray-700 hover:bg-gray-800/70">
+                    <td className="p-4 text-center font-bold text-white border-r border-gray-700 bg-gray-800">
+                      {rowIdx + 1}
+                    </td>
+                    {row.map((cell, colIdx) => (
+                      <td key={colIdx} className="p-2 border-l border-gray-700">
                         <input
                           type="text"
-                          value={row.value}
-                          onChange={(e) => {
-                            const newRecords = [...records];
-                            newRecords[idx].value = e.target.value;
-                            setRecords(newRecords);
-                            saveRecord(idx + 1, e.target.value);
-                          }}
-                          className="w-full bg-gray-950 border border-gray-600 focus:border-blue-500 rounded-xl px-4 py-3 outline-none text-base"
+                          value={cell.value}
+                          onChange={(e) => updateCell(rowIdx, colIdx, e.target.value)}
+                          className="w-full bg-[#1e2937] text-white border border-gray-600 focus:border-blue-500 rounded-xl px-4 py-3 outline-none text-base placeholder-gray-500"
                           placeholder="ФИО / данные..."
                         />
                       </td>
