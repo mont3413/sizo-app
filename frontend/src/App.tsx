@@ -1,4 +1,4 @@
-import { useMemo, useState, useEffect } from 'react';
+import { useMemo, useRef, useState, useEffect } from 'react';
 import { ArrowLeft, Plus, Loader2, ChevronLeft, ChevronRight, Image as ImageIcon, Check } from 'lucide-react';
 import { format } from 'date-fns';
 
@@ -19,6 +19,7 @@ function App() {
   const [sizoHasImage, setSizoHasImage] = useState<Record<string, boolean>>({});
   const [sizoImageUrl, setSizoImageUrl] = useState<string | null>(null);
   const [isUploadingImage, setIsUploadingImage] = useState(false);
+  const [isImageViewerOpen, setIsImageViewerOpen] = useState(false);
   const [currentMonth, setCurrentMonth] = useState(new Date());
 
   const dateStr = format(selectedDate, 'yyyy-MM-dd');
@@ -164,22 +165,87 @@ function App() {
 
   const fileInputId = useMemo(() => `sizo-image-${dateStr}-${currentType ?? 'none'}-${currentSizo ?? 'none'}`, [dateStr, currentType, currentSizo]);
 
-  const saveCell = (rowIdx: number, value: string, resolved: boolean) => {
+  const saveTimersRef = useRef<Record<number, number | undefined>>({});
+  const pendingSavesRef = useRef<Record<number, { value: string; resolved: boolean }>>({});
+  const imageLongPressTimerRef = useRef<number | null>(null);
+  const imageLongPressActiveRef = useRef(false);
+
+  const handleSaveImage = async () => {
+    if (!sizoImageUrl) return;
+
+    // iOS/Telegram WebView often ignores <a download>. Web Share works more reliably.
+    try {
+      if (navigator.share) {
+        const blob = await fetch(sizoImageUrl).then((r) => r.blob());
+        const ext = blob.type === 'image/png' ? 'png' : blob.type === 'image/webp' ? 'webp' : 'jpg';
+        const name = `sizo-${dateStr}-${currentType ?? 'type'}-${currentSizo ?? 'sizo'}.${ext}`;
+        const file = new File([blob], name, { type: blob.type || 'image/jpeg' });
+
+        const canShareFiles =
+          typeof (navigator as any).canShare === 'function' ? (navigator as any).canShare({ files: [file] }) : true;
+
+        if (canShareFiles) {
+          await navigator.share({ files: [file], title: name });
+          return;
+        }
+      }
+    } catch {
+      // ignore and fallback
+    }
+
+    // Fallback: open image itself (user can long-press or use browser UI)
+    window.open(sizoImageUrl, '_blank', 'noopener,noreferrer');
+  };
+
+  const saveCellNow = (rowIdx: number, value: string, resolved: boolean) => {
     if (!currentType || !currentSizo) return;
     const cellNum = rowIdx + 1;
     fetch(`${BACKEND_URL}/records`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
+      // keepalive helps ensure the last save is sent even if user navigates away quickly
+      keepalive: true,
       body: JSON.stringify({ date: dateStr, type: currentType, sizo: currentSizo, rowNum: cellNum, value, resolved })
     });
   };
+
+  const scheduleSave = (rowIdx: number, value: string, resolved: boolean) => {
+    pendingSavesRef.current[rowIdx] = { value, resolved };
+    const existing = saveTimersRef.current[rowIdx];
+    if (existing) window.clearTimeout(existing);
+    saveTimersRef.current[rowIdx] = window.setTimeout(() => {
+      const pending = pendingSavesRef.current[rowIdx];
+      if (!pending) return;
+      delete pendingSavesRef.current[rowIdx];
+      saveCellNow(rowIdx, pending.value, pending.resolved);
+    }, 400);
+  };
+
+  const flushPendingSaves = () => {
+    const entries = Object.entries(pendingSavesRef.current);
+    if (!entries.length) return;
+    for (const [k, v] of entries) {
+      const rowIdx = Number(k);
+      const t = saveTimersRef.current[rowIdx];
+      if (t) window.clearTimeout(t);
+      saveCellNow(rowIdx, v.value, v.resolved);
+      delete pendingSavesRef.current[rowIdx];
+    }
+  };
+
+  useEffect(() => {
+    return () => {
+      flushPendingSaves();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dateStr, currentType, currentSizo]);
 
   const updateCell = (rowIdx: number, value: string) => {
     const newData = [...tableData];
     const prev = newData[rowIdx][0].value ?? '';
     newData[rowIdx][0].value = value;
     setTableData(newData);
-    saveCell(rowIdx, value, newData[rowIdx][0].resolved);
+    scheduleSave(rowIdx, value, newData[rowIdx][0].resolved);
 
     if (currentSizo) {
       const prevFilled = prev.trim().length > 0;
@@ -199,11 +265,57 @@ function App() {
     const current = newData[rowIdx][0];
     current.resolved = !current.resolved;
     setTableData(newData);
-    saveCell(rowIdx, current.value, current.resolved);
+    // status change should persist quickly
+    scheduleSave(rowIdx, current.value, current.resolved);
   };
 
   return (
     <div className="min-h-screen bg-black text-white pb-20">
+      {isImageViewerOpen && sizoImageUrl && (
+        <div
+          className="fixed inset-0 z-[60] bg-black/90 p-4 flex items-center justify-center"
+          role="dialog"
+          aria-modal="true"
+          onPointerDown={() => {
+            imageLongPressActiveRef.current = false;
+            if (imageLongPressTimerRef.current) window.clearTimeout(imageLongPressTimerRef.current);
+            imageLongPressTimerRef.current = window.setTimeout(() => {
+              imageLongPressActiveRef.current = true;
+            }, 350);
+          }}
+          onPointerUp={() => {
+            if (imageLongPressTimerRef.current) window.clearTimeout(imageLongPressTimerRef.current);
+            imageLongPressTimerRef.current = null;
+          }}
+          onPointerCancel={() => {
+            if (imageLongPressTimerRef.current) window.clearTimeout(imageLongPressTimerRef.current);
+            imageLongPressTimerRef.current = null;
+          }}
+          onClick={() => {
+            // If user long-pressed to open iOS image menu, ignore the click that can fire after release.
+            if (imageLongPressActiveRef.current) return;
+            setIsImageViewerOpen(false);
+          }}
+        >
+          <div className="relative max-w-4xl w-full" onClick={(e) => e.stopPropagation()}>
+            <div className="flex items-center justify-end mb-3">
+              <button
+                type="button"
+                className="inline-flex items-center justify-center px-4 py-2 rounded-2xl font-bold bg-zinc-800 hover:bg-zinc-700 text-white"
+                onClick={handleSaveImage}
+              >
+                Сохранить
+              </button>
+            </div>
+            <img
+              src={sizoImageUrl}
+              alt="Фото СИЗО (просмотр)"
+              className="w-full max-h-[80vh] object-contain rounded-3xl border border-zinc-700 bg-black"
+            />
+          </div>
+        </div>
+      )}
+
       <div className="max-w-4xl mx-auto p-4">
         <h1 className="text-4xl font-bold text-center mb-8 text-white">📅 Запись в СИЗО</h1>
 
@@ -286,6 +398,7 @@ function App() {
           <div className="flex items-center gap-4 mb-6 sticky top-0 bg-black py-3 z-40">
             <button
               onClick={() => {
+                flushPendingSaves();
                 if (currentSizo) {
                   setCurrentSizo(null);
                   setTableData([]);
@@ -305,31 +418,38 @@ function App() {
           </div>
 
           {!currentSizo ? (
-            <div className="bg-zinc-950 rounded-3xl p-6 border border-zinc-700">
-              <div className="grid grid-cols-2 gap-3">
+            <div className="bg-zinc-950 rounded-3xl p-4 border border-zinc-700">
+              <div className="space-y-2">
                 {headers.map((h) => (
                   <button
                     key={h}
                     onClick={() => setCurrentSizo(h)}
-                    className="py-6 bg-zinc-900 hover:bg-zinc-800 rounded-2xl text-lg font-semibold text-white"
+                    className="w-full bg-zinc-900 hover:bg-zinc-800 active:bg-zinc-700 
+                               rounded-2xl border border-zinc-700 hover:border-zinc-600 
+                               transition-all px-4 h-14"
                   >
-                    <div className="flex items-center justify-between gap-3 px-4">
-                      <span>{h}</span>
-                      <div className="flex items-center gap-2">
+                    <div className="flex items-center justify-between gap-3 h-full">
+                      <div className="text-[14px] font-semibold text-white truncate">
+                        {h}
+                      </div>
+
+                      <div className="flex items-center gap-2 shrink-0">
+                        {(sizoCounts[h] ?? 0) > 0 && (
+                          <div className="min-w-[2.25rem] h-8 bg-blue-600 text-white text-[13px] font-bold 
+                                          rounded-2xl flex items-center justify-center px-3">
+                            {sizoCounts[h]}
+                          </div>
+                        )}
+
                         {sizoHasImage[h] && (
-                          <span
-                            className="inline-flex items-center justify-center w-8 h-8 rounded-full bg-zinc-700 text-white"
+                          <div
+                            className="w-8 h-8 rounded-2xl bg-zinc-800 flex items-center justify-center border border-zinc-600"
                             aria-label="Есть фото"
                             title="Есть фото"
                           >
-                            <ImageIcon size={16} />
-                          </span>
+                            <ImageIcon size={18} className="text-zinc-300" />
+                          </div>
                         )}
-                      {(sizoCounts[h] ?? 0) > 0 && (
-                        <span className="min-w-[2.25rem] text-center text-sm font-bold px-3 py-1 rounded-full bg-blue-600 text-white">
-                          {sizoCounts[h]}
-                        </span>
-                      )}
                       </div>
                     </div>
                   </button>
@@ -349,7 +469,8 @@ function App() {
                       <img
                         src={sizoImageUrl}
                         alt="Фото СИЗО"
-                        className="w-full max-h-72 object-contain rounded-2xl border border-zinc-700 bg-black"
+                        className="w-full max-h-72 object-contain rounded-2xl border border-zinc-700 bg-black hover:border-zinc-500 transition-colors cursor-pointer"
+                        onClick={() => setIsImageViewerOpen(true)}
                       />
                     ) : (
                       <div className="w-full h-40 rounded-2xl border border-zinc-700 bg-zinc-900 flex items-center justify-center text-zinc-400">
@@ -380,16 +501,18 @@ function App() {
                     </label>
 
                     {sizoImageUrl && (
-                      <button
-                        type="button"
-                        disabled={isUploadingImage}
-                        onClick={handleDeleteImage}
-                        className={`mt-3 w-full inline-flex items-center justify-center px-4 py-3 rounded-2xl font-bold text-white ${
-                          isUploadingImage ? 'bg-zinc-700' : 'bg-red-600 hover:bg-red-700'
-                        }`}
-                      >
-                        Удалить
-                      </button>
+                      <div className="mt-3 space-y-3">
+                        <button
+                          type="button"
+                          disabled={isUploadingImage}
+                          onClick={handleDeleteImage}
+                          className={`w-full inline-flex items-center justify-center px-4 py-3 rounded-2xl font-bold text-white ${
+                            isUploadingImage ? 'bg-zinc-700' : 'bg-red-600 hover:bg-red-700'
+                          }`}
+                        >
+                          Удалить
+                        </button>
+                      </div>
                     )}
                   </div>
                 </div>
@@ -411,28 +534,32 @@ function App() {
                 <tbody>
                   {tableData.map((row, rowIdx) => (
                     <tr key={rowIdx} className="border-t border-zinc-800 hover:bg-zinc-900">
-                      <td className="p-4 text-center font-bold text-white bg-zinc-900 z-10 text-sm">
+                      <td className="px-3 py-2 text-center font-bold text-white bg-zinc-900 z-10 text-xs">
                         {rowIdx + 1}
                       </td>
-                      <td className="p-2">
+                      <td className="px-2 py-2">
                         <input
                           type="text"
                           value={row[0]?.value ?? ''}
                           onChange={(e) => updateCell(rowIdx, e.target.value)}
+                          onBlur={() => {
+                            const cell = tableData[rowIdx]?.[0];
+                            if (cell) saveCellNow(rowIdx, cell.value, cell.resolved);
+                          }}
                           className="w-full bg-zinc-950 text-white border border-zinc-600 focus:border-blue-500 
-                                     rounded-2xl px-4 py-4 text-[14px] leading-tight min-h-[48px]"
+                                     rounded-2xl px-3 py-2 text-[16px] leading-tight min-h-[40px]"
                         />
                       </td>
                       <td className="p-2 text-center">
                         <button
                           type="button"
                           onClick={() => toggleResolved(rowIdx)}
-                          className={`inline-flex items-center justify-center w-12 h-12 rounded-2xl border ${
+                          className={`inline-flex items-center justify-center w-10 h-10 rounded-2xl border ${
                             row[0]?.resolved ? 'bg-green-600 border-green-500' : 'bg-zinc-900 border-zinc-700'
                           }`}
                           aria-label={row[0]?.resolved ? 'Отменить галочку' : 'Поставить галочку'}
                         >
-                          {row[0]?.resolved ? <Check size={22} className="text-white" /> : null}
+                          <Check size={20} className={row[0]?.resolved ? 'text-white' : 'text-transparent'} />
                         </button>
                       </td>
                     </tr>

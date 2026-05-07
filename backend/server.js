@@ -1,8 +1,9 @@
 const express = require('express');
 const cors = require('cors');
-const Database = require('better-sqlite3');
 const path = require('path');
 const multer = require('multer');
+const { Pool } = require('pg');
+const Database = require('better-sqlite3');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -10,151 +11,340 @@ const PORT = process.env.PORT || 3001;
 app.use(cors());
 app.use(express.json());
 
-const db = new Database(path.join(__dirname, 'sizo.db'));
 const upload = multer({
   storage: multer.memoryStorage(),
   limits: { fileSize: 8 * 1024 * 1024 } // 8MB
 });
 
-console.log('✅ База данных создана');
+const USE_PG = Boolean(process.env.DATABASE_URL);
+let pool = null;
+let sqlite = null;
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS records (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    date TEXT NOT NULL,
-    type TEXT NOT NULL,
-    sizo TEXT NOT NULL,
-    rowNum INTEGER NOT NULL,
-    value TEXT,
-    resolved INTEGER NOT NULL DEFAULT 0,
-    UNIQUE(date, type, sizo, rowNum)
-  );
-`);
-
-// lightweight migration for older DBs
-try {
-  const cols = db.prepare(`PRAGMA table_info(records)`).all();
-  const hasResolved = cols.some((c) => c.name === 'resolved');
-  if (!hasResolved) {
-    db.exec(`ALTER TABLE records ADD COLUMN resolved INTEGER NOT NULL DEFAULT 0;`);
-  }
-} catch (e) {
-  console.warn('⚠️ Migration skipped:', e?.message ?? e);
+function mapRecordRow(row) {
+  // Normalize sqlite/pg column naming for the frontend.
+  return {
+    id: row.id,
+    date: row.date ?? row.day,
+    type: row.type,
+    sizo: row.sizo,
+    rowNum: row.rowNum ?? row.rownum,
+    value: row.value,
+    resolved: row.resolved
+  };
 }
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS sizo_images (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    date TEXT NOT NULL,
-    type TEXT NOT NULL,
-    sizo TEXT NOT NULL,
-    mime TEXT NOT NULL,
-    data BLOB NOT NULL,
-    updatedAt TEXT NOT NULL,
-    UNIQUE(date, type, sizo)
-  );
-`);
+async function initPg() {
+  pool = new Pool({
+    connectionString: process.env.DATABASE_URL,
+    ssl: process.env.DATABASE_SSL === 'false' ? false : { rejectUnauthorized: false }
+  });
 
-app.get('/records/:date/:type', (req, res) => {
-  const { date, type } = req.params;
-  const { sizo } = req.query;
-  if (sizo) {
-    const stmt = db.prepare('SELECT * FROM records WHERE date = ? AND type = ? AND sizo = ?');
-    return res.json(stmt.all(date, type, String(sizo)));
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS records (
+      id BIGSERIAL PRIMARY KEY,
+      day DATE NOT NULL,
+      type TEXT NOT NULL,
+      sizo TEXT NOT NULL,
+      rownum INTEGER NOT NULL,
+      value TEXT,
+      resolved INTEGER NOT NULL DEFAULT 0,
+      UNIQUE(day, type, sizo, rownum)
+    );
+  `);
+
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS sizo_images (
+      id BIGSERIAL PRIMARY KEY,
+      day DATE NOT NULL,
+      type TEXT NOT NULL,
+      sizo TEXT NOT NULL,
+      mime TEXT NOT NULL,
+      data BYTEA NOT NULL,
+      updatedat TIMESTAMPTZ NOT NULL,
+      UNIQUE(day, type, sizo)
+    );
+  `);
+
+  console.log('✅ Postgres schema ready');
+}
+
+function initSqlite() {
+  // Local/dev default. NOTE: On Render Free web services the filesystem is ephemeral; don't rely on this in production there.
+  const dbFilePath = process.env.SQLITE_PATH || path.join(__dirname, 'sizo.db');
+  sqlite = new Database(dbFilePath);
+
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS records (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      date TEXT NOT NULL,
+      type TEXT NOT NULL,
+      sizo TEXT NOT NULL,
+      rowNum INTEGER NOT NULL,
+      value TEXT,
+      resolved INTEGER NOT NULL DEFAULT 0,
+      UNIQUE(date, type, sizo, rowNum)
+    );
+  `);
+
+  try {
+    const cols = sqlite.prepare(`PRAGMA table_info(records)`).all();
+    const hasResolved = cols.some((c) => c.name === 'resolved');
+    if (!hasResolved) {
+      sqlite.exec(`ALTER TABLE records ADD COLUMN resolved INTEGER NOT NULL DEFAULT 0;`);
+    }
+  } catch (e) {
+    console.warn('⚠️ Migration skipped:', e?.message ?? e);
   }
 
-  const stmt = db.prepare('SELECT * FROM records WHERE date = ? AND type = ?');
-  return res.json(stmt.all(date, type));
-});
-
-app.get('/records-summary/:date/:type', (req, res) => {
-  const { date, type } = req.params;
-  const stmt = db.prepare(`
-    SELECT sizo, COUNT(*) as count
-    FROM records
-    WHERE date = ? AND type = ? AND value IS NOT NULL AND value != ''
-    GROUP BY sizo
+  sqlite.exec(`
+    CREATE TABLE IF NOT EXISTS sizo_images (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      date TEXT NOT NULL,
+      type TEXT NOT NULL,
+      sizo TEXT NOT NULL,
+      mime TEXT NOT NULL,
+      data BLOB NOT NULL,
+      updatedAt TEXT NOT NULL,
+      UNIQUE(date, type, sizo)
+    );
   `);
-  return res.json(stmt.all(date, type));
+
+  console.log(`✅ SQLite ready at ${dbFilePath}`);
+}
+
+app.get('/records/:date/:type', async (req, res) => {
+  const { date, type } = req.params;
+  const { sizo } = req.query;
+
+  try {
+    if (USE_PG) {
+      if (sizo) {
+        const { rows } = await pool.query(
+          `SELECT id, day AS date, type, sizo, rownum AS "rowNum", value, resolved
+           FROM records
+           WHERE day = $1::date AND type = $2 AND sizo = $3
+           ORDER BY rownum ASC`,
+          [date, type, String(sizo)]
+        );
+        return res.json(rows.map(mapRecordRow));
+      }
+      const { rows } = await pool.query(
+        `SELECT id, day AS date, type, sizo, rownum AS "rowNum", value, resolved
+         FROM records
+         WHERE day = $1::date AND type = $2
+         ORDER BY sizo ASC, rownum ASC`,
+        [date, type]
+      );
+      return res.json(rows.map(mapRecordRow));
+    }
+
+    if (sizo) {
+      const stmt = sqlite.prepare('SELECT * FROM records WHERE date = ? AND type = ? AND sizo = ?');
+      return res.json(stmt.all(date, type, String(sizo)));
+    }
+    const stmt = sqlite.prepare('SELECT * FROM records WHERE date = ? AND type = ?');
+    return res.json(stmt.all(date, type));
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: 'db_error' });
+  }
 });
 
-app.get('/sizo-summary/:date/:type', (req, res) => {
+app.get('/records-summary/:date/:type', async (req, res) => {
   const { date, type } = req.params;
+  try {
+    if (USE_PG) {
+      const { rows } = await pool.query(
+        `
+        SELECT sizo, COUNT(*)::int AS count
+        FROM records
+        WHERE day = $1::date AND type = $2 AND value IS NOT NULL AND value <> ''
+        GROUP BY sizo
+        `,
+        [date, type]
+      );
+      return res.json(rows);
+    }
 
-  const stmt = db.prepare(`
-    WITH counts AS (
+    const stmt = sqlite.prepare(`
       SELECT sizo, COUNT(*) as count
       FROM records
       WHERE date = ? AND type = ? AND value IS NOT NULL AND value != ''
       GROUP BY sizo
-    )
-    SELECT
-      i.sizo as sizo,
-      COALESCE(c.count, 0) as count,
-      1 as hasImage
-    FROM sizo_images i
-    LEFT JOIN counts c ON c.sizo = i.sizo
-    WHERE i.date = ? AND i.type = ?
-    UNION
-    SELECT
-      c.sizo as sizo,
-      c.count as count,
-      0 as hasImage
-    FROM counts c
-    WHERE c.sizo NOT IN (
-      SELECT sizo FROM sizo_images WHERE date = ? AND type = ?
-    )
-  `);
-
-  return res.json(stmt.all(date, type, date, type, date, type));
+    `);
+    return res.json(stmt.all(date, type));
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: 'db_error' });
+  }
 });
 
-app.get('/sizo-image/:date/:type/:sizo', (req, res) => {
+app.get('/sizo-summary/:date/:type', async (req, res) => {
+  const { date, type } = req.params;
+  try {
+    if (USE_PG) {
+      const { rows } = await pool.query(
+        `
+        WITH counts AS (
+          SELECT sizo, COUNT(*)::int AS count
+          FROM records
+          WHERE day = $1::date AND type = $2 AND value IS NOT NULL AND value <> ''
+          GROUP BY sizo
+        )
+        SELECT
+          i.sizo AS sizo,
+          COALESCE(c.count, 0) AS count,
+          1 AS "hasImage"
+        FROM sizo_images i
+        LEFT JOIN counts c ON c.sizo = i.sizo
+        WHERE i.day = $3::date AND i.type = $4
+        UNION
+        SELECT
+          c.sizo AS sizo,
+          c.count AS count,
+          0 AS "hasImage"
+        FROM counts c
+        WHERE c.sizo NOT IN (
+          SELECT sizo FROM sizo_images WHERE day = $5::date AND type = $6
+        )
+        `,
+        [date, type, date, type, date, type]
+      );
+      return res.json(rows);
+    }
+
+    const stmt = sqlite.prepare(`
+      WITH counts AS (
+        SELECT sizo, COUNT(*) as count
+        FROM records
+        WHERE date = ? AND type = ? AND value IS NOT NULL AND value != ''
+        GROUP BY sizo
+      )
+      SELECT
+        i.sizo as sizo,
+        COALESCE(c.count, 0) as count,
+        1 as hasImage
+      FROM sizo_images i
+      LEFT JOIN counts c ON c.sizo = i.sizo
+      WHERE i.date = ? AND i.type = ?
+      UNION
+      SELECT
+        c.sizo as sizo,
+        c.count as count,
+        0 as hasImage
+      FROM counts c
+      WHERE c.sizo NOT IN (
+        SELECT sizo FROM sizo_images WHERE date = ? AND type = ?
+      )
+    `);
+    return res.json(stmt.all(date, type, date, type, date, type));
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: 'db_error' });
+  }
+});
+
+app.get('/sizo-image/:date/:type/:sizo', async (req, res) => {
   const { date, type, sizo } = req.params;
-  const stmt = db.prepare(`SELECT mime, data FROM sizo_images WHERE date = ? AND type = ? AND sizo = ?`);
-  const row = stmt.get(date, type, sizo);
-  if (!row) return res.status(404).json({ error: 'not_found' });
-  res.setHeader('Content-Type', row.mime);
-  return res.send(row.data);
+  try {
+    if (USE_PG) {
+      const { rows } = await pool.query(
+        `SELECT mime, data FROM sizo_images WHERE day = $1::date AND type = $2 AND sizo = $3`,
+        [date, type, sizo]
+      );
+      const row = rows[0];
+      if (!row) return res.status(404).json({ error: 'not_found' });
+      res.setHeader('Content-Type', row.mime);
+      return res.send(row.data);
+    }
+
+    const stmt = sqlite.prepare(`SELECT mime, data FROM sizo_images WHERE date = ? AND type = ? AND sizo = ?`);
+    const row = stmt.get(date, type, sizo);
+    if (!row) return res.status(404).json({ error: 'not_found' });
+    res.setHeader('Content-Type', row.mime);
+    return res.send(row.data);
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: 'db_error' });
+  }
 });
 
 // Simple gallery page to view all saved images in a browser.
 // Optional filters: ?date=YYYY-MM-DD&type=advocate|transfer|visit
-app.get('/photos', (req, res) => {
+app.get('/photos', async (req, res) => {
   const { date, type } = req.query;
-  let rows = [];
-  if (date && type) {
-    const stmt = db.prepare(
-      `SELECT date, type, sizo, mime, updatedAt FROM sizo_images WHERE date = ? AND type = ? ORDER BY updatedAt DESC`
-    );
-    rows = stmt.all(String(date), String(type));
-  } else if (date) {
-    const stmt = db.prepare(
-      `SELECT date, type, sizo, mime, updatedAt FROM sizo_images WHERE date = ? ORDER BY updatedAt DESC`
-    );
-    rows = stmt.all(String(date));
-  } else if (type) {
-    const stmt = db.prepare(
-      `SELECT date, type, sizo, mime, updatedAt FROM sizo_images WHERE type = ? ORDER BY updatedAt DESC`
-    );
-    rows = stmt.all(String(type));
-  } else {
-    const stmt = db.prepare(`SELECT date, type, sizo, mime, updatedAt FROM sizo_images ORDER BY updatedAt DESC`);
-    rows = stmt.all();
-  }
+  try {
+    let rows = [];
+    if (USE_PG) {
+      if (date && type) {
+        const { rows: r } = await pool.query(
+          `SELECT day AS date, type, sizo, mime, updatedat AS "updatedAt"
+           FROM sizo_images
+           WHERE day = $1::date AND type = $2
+           ORDER BY updatedat DESC`,
+          [String(date), String(type)]
+        );
+        rows = r;
+      } else if (date) {
+        const { rows: r } = await pool.query(
+          `SELECT day AS date, type, sizo, mime, updatedat AS "updatedAt"
+           FROM sizo_images
+           WHERE day = $1::date
+           ORDER BY updatedat DESC`,
+          [String(date)]
+        );
+        rows = r;
+      } else if (type) {
+        const { rows: r } = await pool.query(
+          `SELECT day AS date, type, sizo, mime, updatedat AS "updatedAt"
+           FROM sizo_images
+           WHERE type = $1
+           ORDER BY updatedat DESC`,
+          [String(type)]
+        );
+        rows = r;
+      } else {
+        const { rows: r } = await pool.query(
+          `SELECT day AS date, type, sizo, mime, updatedat AS "updatedAt"
+           FROM sizo_images
+           ORDER BY updatedat DESC`
+        );
+        rows = r;
+      }
+    } else {
+      if (date && type) {
+        const stmt = sqlite.prepare(
+          `SELECT date, type, sizo, mime, updatedAt FROM sizo_images WHERE date = ? AND type = ? ORDER BY updatedAt DESC`
+        );
+        rows = stmt.all(String(date), String(type));
+      } else if (date) {
+        const stmt = sqlite.prepare(
+          `SELECT date, type, sizo, mime, updatedAt FROM sizo_images WHERE date = ? ORDER BY updatedAt DESC`
+        );
+        rows = stmt.all(String(date));
+      } else if (type) {
+        const stmt = sqlite.prepare(
+          `SELECT date, type, sizo, mime, updatedAt FROM sizo_images WHERE type = ? ORDER BY updatedAt DESC`
+        );
+        rows = stmt.all(String(type));
+      } else {
+        const stmt = sqlite.prepare(`SELECT date, type, sizo, mime, updatedAt FROM sizo_images ORDER BY updatedAt DESC`);
+        rows = stmt.all();
+      }
+    }
 
-  const escape = (s) =>
-    String(s)
-      .replaceAll('&', '&amp;')
-      .replaceAll('<', '&lt;')
-      .replaceAll('>', '&gt;')
-      .replaceAll('"', '&quot;')
-      .replaceAll("'", '&#039;');
+    const escape = (s) =>
+      String(s)
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#039;');
 
-  const cards = rows
-    .map((r) => {
-      const imgSrc = `/sizo-image/${encodeURIComponent(r.date)}/${encodeURIComponent(r.type)}/${encodeURIComponent(r.sizo)}`;
-      return `
+    const cards = rows
+      .map((r) => {
+        const imgSrc = `/sizo-image/${encodeURIComponent(r.date)}/${encodeURIComponent(r.type)}/${encodeURIComponent(r.sizo)}`;
+        return `
         <div class="card">
           <div class="meta">
             <div class="title">${escape(r.date)} · ${escape(r.type)} · ${escape(r.sizo)}</div>
@@ -165,13 +355,13 @@ app.get('/photos', (req, res) => {
           </a>
         </div>
       `;
-    })
-    .join('\n');
+      })
+      .join('\n');
 
-  return res
-    .status(200)
-    .setHeader('Content-Type', 'text/html; charset=utf-8')
-    .end(`<!doctype html>
+    return res
+      .status(200)
+      .setHeader('Content-Type', 'text/html; charset=utf-8')
+      .end(`<!doctype html>
 <html lang="ru">
   <head>
     <meta charset="utf-8" />
@@ -200,16 +390,33 @@ app.get('/photos', (req, res) => {
     </div>
   </body>
 </html>`);
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: 'db_error' });
+  }
 });
 
-app.delete('/sizo-image/:date/:type/:sizo', (req, res) => {
+app.delete('/sizo-image/:date/:type/:sizo', async (req, res) => {
   const { date, type, sizo } = req.params;
-  const stmt = db.prepare(`DELETE FROM sizo_images WHERE date = ? AND type = ? AND sizo = ?`);
-  const info = stmt.run(date, type, sizo);
-  return res.json({ success: true, deleted: info.changes });
+  try {
+    if (USE_PG) {
+      const { rowCount } = await pool.query(
+        `DELETE FROM sizo_images WHERE day = $1::date AND type = $2 AND sizo = $3`,
+        [date, type, sizo]
+      );
+      return res.json({ success: true, deleted: rowCount });
+    }
+
+    const stmt = sqlite.prepare(`DELETE FROM sizo_images WHERE date = ? AND type = ? AND sizo = ?`);
+    const info = stmt.run(date, type, sizo);
+    return res.json({ success: true, deleted: info.changes });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: 'db_error' });
+  }
 });
 
-app.post('/sizo-image', upload.single('image'), (req, res) => {
+app.post('/sizo-image', upload.single('image'), async (req, res) => {
   const { date, type, sizo } = req.body;
   if (!date || !type || !sizo) return res.status(400).json({ error: 'missing_fields' });
   if (!req.file) return res.status(400).json({ error: 'missing_image' });
@@ -218,28 +425,79 @@ app.post('/sizo-image', upload.single('image'), (req, res) => {
   const data = req.file.buffer;
   const updatedAt = new Date().toISOString();
 
-  const stmt = db.prepare(`
-    INSERT INTO sizo_images (date, type, sizo, mime, data, updatedAt)
-    VALUES (?, ?, ?, ?, ?, ?)
-    ON CONFLICT(date, type, sizo)
-    DO UPDATE SET mime = excluded.mime, data = excluded.data, updatedAt = excluded.updatedAt
-  `);
-  stmt.run(date, type, sizo, mime, data, updatedAt);
-  return res.json({ success: true });
+  try {
+    if (USE_PG) {
+      await pool.query(
+        `
+        INSERT INTO sizo_images (day, type, sizo, mime, data, updatedat)
+        VALUES ($1::date, $2, $3, $4, $5, $6::timestamptz)
+        ON CONFLICT (day, type, sizo)
+        DO UPDATE SET mime = EXCLUDED.mime, data = EXCLUDED.data, updatedat = EXCLUDED.updatedat
+        `,
+        [date, type, sizo, mime, data, updatedAt]
+      );
+      return res.json({ success: true });
+    }
+
+    const stmt = sqlite.prepare(`
+      INSERT INTO sizo_images (date, type, sizo, mime, data, updatedAt)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(date, type, sizo)
+      DO UPDATE SET mime = excluded.mime, data = excluded.data, updatedAt = excluded.updatedAt
+    `);
+    stmt.run(date, type, sizo, mime, data, updatedAt);
+    return res.json({ success: true });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: 'db_error' });
+  }
 });
 
-app.post('/records', (req, res) => {
+app.post('/records', async (req, res) => {
   const { date, type, sizo, rowNum, value, resolved } = req.body;
-  const stmt = db.prepare(`
-    INSERT INTO records (date, type, sizo, rowNum, value, resolved)
-    VALUES (?, ?, ?, ?, ?, ?)
-    ON CONFLICT(date, type, sizo, rowNum) 
-    DO UPDATE SET value = excluded.value, resolved = excluded.resolved
-  `);
-  stmt.run(date, type, sizo || 'main', rowNum, value || '', resolved ? 1 : 0);
-  res.json({ success: true });
+  try {
+    if (USE_PG) {
+      await pool.query(
+        `
+        INSERT INTO records (day, type, sizo, rownum, value, resolved)
+        VALUES ($1::date, $2, $3, $4, $5, $6)
+        ON CONFLICT (day, type, sizo, rownum)
+        DO UPDATE SET value = EXCLUDED.value, resolved = EXCLUDED.resolved
+        `,
+        [date, type, sizo || 'main', rowNum, value || '', resolved ? 1 : 0]
+      );
+      return res.json({ success: true });
+    }
+
+    const stmt = sqlite.prepare(`
+      INSERT INTO records (date, type, sizo, rowNum, value, resolved)
+      VALUES (?, ?, ?, ?, ?, ?)
+      ON CONFLICT(date, type, sizo, rowNum) 
+      DO UPDATE SET value = excluded.value, resolved = excluded.resolved
+    `);
+    stmt.run(date, type, sizo || 'main', rowNum, value || '', resolved ? 1 : 0);
+    return res.json({ success: true });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: 'db_error' });
+  }
 });
 
-app.listen(PORT, () => {
-  console.log(`🚀 Сервер запущен: http://localhost:${PORT}`);
+async function start() {
+  if (USE_PG) {
+    console.log('🧠 Using Postgres (DATABASE_URL is set)');
+    await initPg();
+  } else {
+    console.log('🧠 Using SQLite (DATABASE_URL is not set)');
+    initSqlite();
+  }
+
+  app.listen(PORT, () => {
+    console.log(`🚀 Сервер запущен: http://localhost:${PORT}`);
+  });
+}
+
+start().catch((e) => {
+  console.error('❌ Failed to start server:', e);
+  process.exit(1);
 });
