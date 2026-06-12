@@ -1,17 +1,8 @@
 {
   "$schema": "https://openapi.vercel.sh/vercel.json",
-  "experimentalServices": {
-    "web": {
-      "entrypoint": "frontend",
-      "routePrefix": "/",
-      "framework": "vite"
-    },
-    "api": {
-      "entrypoint": "backend/server.js",
-      "framework": "express",
-      "maxDuration": 10
-    }
-  },
+  "installCommand": "npm install --prefix frontend && npm install --prefix backend --omit=optional",
+  "buildCommand": "npm run build --prefix frontend",
+  "outputDirectory": "frontend/dist",
   "rewrites": [
     { "source": "/records", "destination": "/backend/server.js" },
     { "source": "/records/:path*", "destination": "/backend/server.js" },
@@ -20,5 +11,10 @@
     { "source": "/sizo-image", "destination": "/backend/server.js" },
     { "source": "/sizo-image/:path*", "destination": "/backend/server.js" },
     { "source": "/photos", "destination": "/backend/server.js" }
-  ]
+  ],
+  "functions": {
+    "backend/server.js": {
+      "maxDuration": 10
+    }
+  }
 }
