@@ -57,20 +57,29 @@ function App() {
   useEffect(() => {
     if (currentType && currentSizo) {
       setIsLoading(true);
-      const url = new URL(`${BACKEND_URL}/records/${dateStr}/${currentType}`);
-      url.searchParams.set('sizo', currentSizo);
+      const qs = new URLSearchParams({ sizo: currentSizo });
+      const url = `${BACKEND_URL}/records/${dateStr}/${currentType}?${qs}`;
 
-      fetch(url.toString())
-        .then(r => r.json())
+      fetch(url)
+        .then((r) => {
+          if (!r.ok) throw new Error(`records ${r.status}`);
+          return r.json();
+        })
         .then((data: any[]) => {
+          const rows = Array.isArray(data) ? data : [];
           const newData = Array.from({ length: 15 }, (_, rowIdx) =>
             Array.from({ length: 1 }, () => {
               const cellNum = rowIdx + 1;
-              const existing = data.find((rec: any) => rec.rowNum === cellNum);
+              const existing = rows.find((rec: any) => rec.rowNum === cellNum);
               return { value: existing?.value || '', resolved: Boolean(existing?.resolved) };
             })
           );
           setTableData(newData);
+        })
+        .catch(() => {
+          setTableData(
+            Array.from({ length: 15 }, () => [{ value: '', resolved: false }])
+          );
         })
         .finally(() => setIsLoading(false));
     }
