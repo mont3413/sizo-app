@@ -3,7 +3,6 @@ const cors = require('cors');
 const path = require('path');
 const multer = require('multer');
 const { Pool } = require('pg');
-const Database = require('better-sqlite3');
 
 const app = express();
 const PORT = process.env.PORT || 3001;
@@ -70,6 +69,15 @@ async function initPg() {
 
 function initSqlite() {
   // Local/dev default. NOTE: On Render Free web services the filesystem is ephemeral; don't rely on this in production there.
+  let Database;
+  try {
+    Database = require('better-sqlite3');
+  } catch (e) {
+    throw new Error(
+      'SQLite unavailable. Set DATABASE_URL for Postgres or install better-sqlite3 for local dev.'
+    );
+  }
+
   const dbFilePath = process.env.SQLITE_PATH || path.join(__dirname, 'sizo.db');
   sqlite = new Database(dbFilePath);
 
@@ -111,6 +119,33 @@ function initSqlite() {
 
   console.log(`✅ SQLite ready at ${dbFilePath}`);
 }
+
+let dbInitPromise = null;
+
+async function ensureDbReady() {
+  if (!dbInitPromise) {
+    dbInitPromise = (async () => {
+      if (USE_PG) {
+        console.log('🧠 Using Postgres (DATABASE_URL is set)');
+        await initPg();
+      } else {
+        console.log('🧠 Using SQLite (DATABASE_URL is not set)');
+        initSqlite();
+      }
+    })();
+  }
+  return dbInitPromise;
+}
+
+app.use(async (req, res, next) => {
+  try {
+    await ensureDbReady();
+    next();
+  } catch (e) {
+    console.error('❌ DB init failed:', e);
+    res.status(500).json({ error: 'db_init_failed' });
+  }
+});
 
 app.get('/records/:date/:type', async (req, res) => {
   const { date, type } = req.params;
@@ -484,20 +519,17 @@ app.post('/records', async (req, res) => {
 });
 
 async function start() {
-  if (USE_PG) {
-    console.log('🧠 Using Postgres (DATABASE_URL is set)');
-    await initPg();
-  } else {
-    console.log('🧠 Using SQLite (DATABASE_URL is not set)');
-    initSqlite();
-  }
-
+  await ensureDbReady();
   app.listen(PORT, () => {
     console.log(`🚀 Сервер запущен: http://localhost:${PORT}`);
   });
 }
 
-start().catch((e) => {
-  console.error('❌ Failed to start server:', e);
-  process.exit(1);
-});
+module.exports = app;
+
+if (require.main === module) {
+  start().catch((e) => {
+    console.error('❌ Failed to start server:', e);
+    process.exit(1);
+  });
+}

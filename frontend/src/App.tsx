@@ -4,7 +4,7 @@ import { format } from 'date-fns';
 
 const BACKEND_URL =
   import.meta.env.VITE_BACKEND_URL ??
-  (import.meta.env.PROD ? 'https://sizo-app.onrender.com' : 'http://localhost:3001');
+  (import.meta.env.PROD ? '' : 'http://localhost:3001');
 
 type Cell = { value: string; resolved: boolean };
 
@@ -34,7 +34,12 @@ function App() {
 
   // Календарь
   const daysInMonth = new Date(currentMonth.getFullYear(), currentMonth.getMonth() + 1, 0).getDate();
-  const firstDay = new Date(currentMonth.getFullYear(), currentMonth.getMonth(), 1).getDay();
+  // JS getDay(): 0 = Sunday ... 6 = Saturday.
+  // UI starts from Monday, so shift Sunday to the end.
+  const firstDay = (() => {
+    const jsDay = new Date(currentMonth.getFullYear(), currentMonth.getMonth(), 1).getDay();
+    return jsDay === 0 ? 6 : jsDay - 1;
+  })();
 
   const generateCalendarDays = () => {
     const days = [];
