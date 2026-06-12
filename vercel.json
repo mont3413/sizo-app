@@ -4,17 +4,18 @@
   "buildCommand": "npm run build --prefix frontend",
   "outputDirectory": "frontend/dist",
   "rewrites": [
-    { "source": "/records", "destination": "/backend/server.js" },
-    { "source": "/records/:path*", "destination": "/backend/server.js" },
-    { "source": "/records-summary/:path*", "destination": "/backend/server.js" },
-    { "source": "/sizo-summary/:path*", "destination": "/backend/server.js" },
-    { "source": "/sizo-image", "destination": "/backend/server.js" },
-    { "source": "/sizo-image/:path*", "destination": "/backend/server.js" },
-    { "source": "/photos", "destination": "/backend/server.js" }
+    { "source": "/records", "destination": "/api" },
+    { "source": "/records/:path*", "destination": "/api" },
+    { "source": "/records-summary/:path*", "destination": "/api" },
+    { "source": "/sizo-summary/:path*", "destination": "/api" },
+    { "source": "/sizo-image", "destination": "/api" },
+    { "source": "/sizo-image/:path*", "destination": "/api" },
+    { "source": "/photos", "destination": "/api" }
   ],
   "functions": {
-    "backend/server.js": {
-      "maxDuration": 10
+    "api/index.js": {
+      "maxDuration": 10,
+      "includeFiles": "backend/**"
     }
   }
 }
